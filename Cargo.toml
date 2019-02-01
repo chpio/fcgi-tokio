@@ -1,0 +1,10 @@
+[package]
+name = "fcgi-tokio"
+version = "0.0.0"
+authors = ["Thomas Heck <t@b128.net>"]
+edition = "2018"
+
+[dependencies]
+bytes = "0.4"
+tokio = "0.1"
+futures = "0.1"
