@@ -1,6 +1,7 @@
-use bytes::{Buf, BufMut, BytesMut, IntoBuf};
+use bytes::{Buf, BufMut, Bytes, BytesMut, IntoBuf};
+use bytes_queue::BytesQueue;
 use futures::{try_ready, Async, AsyncSink, Poll, Sink, StartSend, Stream};
-use std::collections::VecDeque;
+use std::io::Cursor;
 use tokio::io::{self, AsyncRead, AsyncWrite};
 
 const HEADER_LEN: usize = 8;
@@ -88,29 +89,29 @@ pub enum Record {
     },
     Params {
         request_id: u16,
-        body: BytesMut,
+        body: Bytes,
     },
     StdIn {
         request_id: u16,
-        body: BytesMut,
+        body: Bytes,
     },
     StdOut {
         request_id: u16,
-        body: BytesMut,
+        body: Bytes,
     },
     StdErr {
         request_id: u16,
-        body: BytesMut,
+        body: Bytes,
     },
     Data {
         request_id: u16,
-        body: BytesMut,
+        body: Bytes,
     },
     GetValues {
-        body: BytesMut,
+        body: Bytes,
     },
     GetValuesResult {
-        body: BytesMut,
+        body: Bytes,
     },
     UnknownType {
         type_number: u8,
@@ -198,7 +199,9 @@ where
             return None;
         }
 
-        let buf = read_buf.split_to(state.body_padding_len - state.padding_len as usize);
+        let buf = read_buf
+            .split_to(state.body_padding_len - state.padding_len as usize)
+            .freeze();
         read_buf.advance(state.padding_len as usize);
 
         let request_id = state.request_id;
@@ -277,8 +280,6 @@ where
             type_number @ _ => UnknownType { type_number },
         };
 
-        // assert!(buf.is_empty());
-
         Some(record)
     }
 }
@@ -340,8 +341,7 @@ where
 
 pub struct FcgiEncoder<S> {
     socket: S,
-    queued_bytes: usize,
-    write_queue: VecDeque<BytesMut>,
+    write_queue: BytesQueue<Cursor<Bytes>>,
 }
 
 impl<S> FcgiEncoder<S>
@@ -351,8 +351,7 @@ where
     pub fn new(writer: S) -> FcgiEncoder<S> {
         FcgiEncoder {
             socket: writer,
-            queued_bytes: 0,
-            write_queue: VecDeque::new(),
+            write_queue: BytesQueue::new(),
         }
     }
 }
@@ -367,9 +366,9 @@ where
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
         use Record::*;
 
-        if WRITE_SOFT_LIMIT <= self.queued_bytes
+        if WRITE_SOFT_LIMIT <= self.write_queue.remaining()
             && self.poll_complete()?.is_not_ready()
-            && WRITE_SOFT_LIMIT <= self.queued_bytes
+            && WRITE_SOFT_LIMIT <= self.write_queue.remaining()
         {
             return Ok(AsyncSink::NotReady(item));
         }
@@ -387,9 +386,9 @@ where
                 buf.put_u16_be(role.as_number());
                 buf.put_u8(flags);
                 buf.put_slice(&[0u8; 5]);
-                buf
+                buf.freeze()
             }
-            AbortRequest { request_id: _ } => BytesMut::new(),
+            AbortRequest { request_id: _ } => Bytes::new(),
             EndRequest {
                 request_id: _,
                 app_status,
@@ -399,7 +398,7 @@ where
                 buf.put_u32_be(app_status);
                 buf.put_u8(protocol_status.as_number());
                 buf.put_slice(&[0u8; 3]);
-                buf
+                buf.freeze()
             }
             Params {
                 request_id: _,
@@ -427,7 +426,7 @@ where
                 let mut buf = BytesMut::with_capacity(8);
                 buf.put_u8(type_number);
                 buf.put_slice(&[0u8; 7]);
-                buf
+                buf.freeze()
             }
         };
 
@@ -445,29 +444,16 @@ where
         header.put_u8(0); // padding
         header.put_u8(0);
 
-        self.queued_bytes += HEADER_LEN + body.len();
-        self.write_queue.push_back(header);
-        self.write_queue.push_back(body);
+        self.write_queue.push(header.freeze().into_buf());
+        self.write_queue.push(body.into_buf());
 
         Ok(AsyncSink::Ready)
     }
 
     fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
-        while let Some(front) = self.write_queue.front_mut() {
-            let n = try_ready!(self.socket.poll_write(front));
-
-            // As long as the write buffer is not empty, a successful write should never write 0
-            // bytes.
-            assert!(0 < n);
-
-            front.advance(n);
-            self.queued_bytes -= n;
-
-            if front.is_empty() {
-                self.write_queue.pop_front();
-            }
+        while self.write_queue.has_remaining() {
+            try_ready!(self.socket.write_buf(&mut self.write_queue));
         }
-
         Ok(Async::Ready(()))
     }
 }
