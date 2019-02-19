@@ -8,3 +8,4 @@ edition = "2018"
 bytes = "0.4"
 tokio = "0.1"
 futures = "0.1"
+bytes-queue = { path = "../bytes-queue" }
