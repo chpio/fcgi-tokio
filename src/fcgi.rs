@@ -1,13 +1,13 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut, IntoBuf};
 use bytes_queue::BytesQueue;
-use futures::{try_ready, Async, AsyncSink, Poll, Sink, StartSend, Stream};
+use futures::{sync::mpsc, try_ready, Async, AsyncSink, Future, Poll, Sink, StartSend, Stream};
 use std::io::Cursor;
 use tokio::io::{self, AsyncRead, AsyncWrite};
 
 const HEADER_LEN: usize = 8;
 const WRITE_SOFT_LIMIT: usize = 16 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum Role {
     Responder,
     Authorizer,
@@ -37,7 +37,7 @@ impl Role {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum ProtocolStatus {
     RequestComplete,
     CanNotMultiplexConnection,
@@ -456,4 +456,152 @@ where
         }
         Ok(Async::Ready(()))
     }
+}
+
+const MAX_REQUEST_ID: u16 = 10_000;
+
+struct ServerHandler<R, HF> {
+    reader: FcgiDecoder<R>,
+    encoder_tx: mpsc::Sender<Record>,
+    handler_txes: Vec<Option<mpsc::Sender<Record>>>,
+    handler_management: mpsc::Sender<Record>,
+    next_record: Option<Record>,
+    handler_factory: HF,
+}
+
+impl<R, HF, HFR> ServerHandler<R, HF>
+where
+    R: AsyncRead + Send,
+    HF: FnMut(mpsc::Receiver<Record>) -> HFR,
+    HFR: Stream<Item = Record, Error = ()> + Send + 'static,
+{
+    fn handle_record(&mut self, record: Record) -> Async<()> {
+        let request_id = record.request_id() as usize;
+
+        if request_id == 0 {
+            // TODO: put handler_management into handler_txes?
+            if let Err(e) = self.handler_management.try_send(record) {
+                if e.is_disconnected() {
+                    // TODO: return error?
+                } else if e.is_full() {
+                    self.next_record = Some(e.into_inner());
+                    return Async::NotReady;
+                } else {
+                    unreachable!();
+                }
+            }
+        } else {
+            if let Some(handler_tx_opt) = self.handler_txes.get_mut(request_id) {
+                if let Some(handler_tx) = handler_tx_opt.as_mut() {
+                    if let Err(e) = handler_tx.try_send(record) {
+                        if e.is_disconnected() {
+                            *handler_tx_opt = None;
+                        } else if e.is_full() {
+                            self.next_record = Some(e.into_inner());
+                            return Async::NotReady;
+                        } else {
+                            unreachable!();
+                        }
+                    }
+                }
+            }
+        }
+
+        Async::Ready(())
+    }
+}
+
+impl<R, F, FR> Future for ServerHandler<R, F>
+where
+    R: AsyncRead + Send,
+    F: FnMut(mpsc::Receiver<Record>) -> FR,
+    FR: Stream<Item = Record, Error = ()> + Send + 'static,
+{
+    type Item = ();
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        if let Some(record) = self.next_record.take() {
+            if self.handle_record(record).is_not_ready() {
+                return Ok(Async::NotReady);
+            }
+        }
+
+        loop {
+            let record = try_ready!(self.reader.poll());
+            let record = if let Some(record) = record {
+                record
+            } else {
+                // End of Stream
+                return Ok(Async::Ready(()));
+            };
+
+            if let Record::BeginRequest { request_id, .. } = &record {
+                assert!(*request_id <= MAX_REQUEST_ID);
+
+                let request_id = *request_id as usize;
+
+                // fill handler slots
+                if self.handler_txes.len() <= request_id {
+                    let new = 0..(request_id - self.handler_txes.len() + 1);
+                    let new = new.map(|_| None);
+                    self.handler_txes.extend(new);
+                }
+                let handler_tx = self.handler_txes.get_mut(request_id).unwrap();
+
+                let (tx, rx) = mpsc::channel(8);
+                tokio::spawn(
+                    (self.handler_factory)(rx)
+                        .forward(self.encoder_tx.clone().sink_map_err(|_| ()))
+                        .map(|_| ()),
+                );
+                *handler_tx = Some(tx);
+            }
+
+            if self.handle_record(record).is_not_ready() {
+                return Ok(Async::NotReady);
+            }
+        }
+    }
+}
+
+pub fn server_handler<R, W, HF, HFR, MF, MFR>(
+    reader: R,
+    writer: W,
+    management_factory: MF,
+    handler_factory: HF,
+) where
+    R: AsyncRead + Send + 'static,
+    W: AsyncWrite + Send + 'static,
+    HF: FnMut(mpsc::Receiver<Record>) -> HFR + Send + 'static,
+    HFR: Stream<Item = Record, Error = ()> + Send + 'static,
+    MF: FnOnce(mpsc::Receiver<Record>) -> MFR + Send + 'static,
+    MFR: Stream<Item = Record, Error = ()> + Send + 'static,
+{
+    let (encoder_tx, encoder_rx) = mpsc::channel(8);
+
+    let (management_tx, management_rx) = mpsc::channel(8);
+    tokio::spawn(
+        management_factory(management_rx)
+            .forward(encoder_tx.clone().sink_map_err(|_| ()))
+            .map(|_| ()),
+    );
+
+    tokio::spawn(
+        ServerHandler {
+            reader: FcgiDecoder::new(reader),
+            encoder_tx,
+            handler_txes: Vec::new(),
+            handler_management: management_tx,
+            next_record: None,
+            handler_factory,
+        }
+        .map_err(|_| ()),
+    );
+
+    tokio::spawn(
+        encoder_rx
+            .forward(FcgiEncoder::new(writer).sink_map_err(|_| ()))
+            .map(|_| ()),
+    );
 }
