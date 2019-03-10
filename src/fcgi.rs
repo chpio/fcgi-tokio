@@ -7,7 +7,7 @@ use tokio::io::{self, AsyncRead, AsyncWrite};
 const HEADER_LEN: usize = 8;
 const WRITE_SOFT_LIMIT: usize = 16 * 1024;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Role {
     Responder,
     Authorizer,
@@ -37,7 +37,7 @@ impl Role {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProtocolStatus {
     RequestComplete,
     CanNotMultiplexConnection,
@@ -70,8 +70,8 @@ impl ProtocolStatus {
     }
 }
 
-#[derive(Debug)]
-pub enum Record {
+#[derive(Clone, Debug)]
+pub enum MultiplexRecord {
     BeginRequest {
         request_id: u16,
         role: Role,
@@ -118,9 +118,9 @@ pub enum Record {
     },
 }
 
-impl Record {
+impl MultiplexRecord {
     pub fn as_type_number(&self) -> u8 {
-        use Record::*;
+        use MultiplexRecord::*;
 
         match self {
             BeginRequest { .. } => 1,
@@ -138,7 +138,7 @@ impl Record {
     }
 
     pub fn request_id(&self) -> u16 {
-        use Record::*;
+        use MultiplexRecord::*;
 
         match self {
             BeginRequest { request_id, .. } => *request_id,
@@ -152,6 +152,122 @@ impl Record {
             GetValues { .. } => 0,
             GetValuesResult { .. } => 0,
             UnknownType { .. } => 0,
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the `MultiplexRecord` can not be converted into a `Record`.
+    pub fn into_record(self) -> Record {
+        use MultiplexRecord::*;
+        match self {
+            BeginRequest {
+                request_id,
+                role,
+                flags,
+            } => {
+                assert_ne!(request_id, 0);
+                Record::BeginRequest { role, flags }
+            }
+            AbortRequest { request_id } => {
+                assert_ne!(request_id, 0);
+                Record::AbortRequest
+            }
+            EndRequest {
+                request_id,
+                app_status,
+                protocol_status,
+            } => {
+                assert_ne!(request_id, 0);
+                Record::EndRequest {
+                    app_status,
+                    protocol_status,
+                }
+            }
+            Params { request_id, body } => {
+                assert_ne!(request_id, 0);
+                Record::Params { body }
+            }
+            StdIn { request_id, body } => {
+                assert_ne!(request_id, 0);
+                Record::StdIn { body }
+            }
+            StdOut { request_id, body } => {
+                assert_ne!(request_id, 0);
+                Record::StdOut { body }
+            }
+            StdErr { request_id, body } => {
+                assert_ne!(request_id, 0);
+                Record::StdErr { body }
+            }
+            Data { request_id, body } => {
+                assert_ne!(request_id, 0);
+                Record::Data { body }
+            }
+            GetValues { .. } | GetValuesResult { .. } | UnknownType { .. } => {
+                panic!("Can not convert management `MultiplexRecord` into `Record`");
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Record {
+    BeginRequest {
+        role: Role,
+        flags: u8, // TODO
+    },
+    AbortRequest,
+    EndRequest {
+        /// CGI exit code
+        app_status: u32,
+        protocol_status: ProtocolStatus,
+    },
+    Params {
+        body: Bytes,
+    },
+    StdIn {
+        body: Bytes,
+    },
+    StdOut {
+        body: Bytes,
+    },
+    StdErr {
+        body: Bytes,
+    },
+    Data {
+        body: Bytes,
+    },
+}
+
+impl Record {
+    pub fn into_multiplex_record(self, request_id: u16) -> MultiplexRecord {
+        use Record::*;
+
+        match self {
+            BeginRequest { role, flags } => {
+                MultiplexRecord::BeginRequest {
+                    request_id,
+                    role,
+                    flags,
+                }
+            }
+            AbortRequest => MultiplexRecord::AbortRequest { request_id },
+            EndRequest {
+                app_status,
+                protocol_status,
+            } => {
+                MultiplexRecord::EndRequest {
+                    request_id,
+                    app_status,
+                    protocol_status,
+                }
+            }
+            Params { body } => MultiplexRecord::Params { request_id, body },
+            StdIn { body } => MultiplexRecord::StdIn { request_id, body },
+            StdOut { body } => MultiplexRecord::StdOut { request_id, body },
+            StdErr { body } => MultiplexRecord::StdErr { request_id, body },
+            Data { body } => MultiplexRecord::Data { request_id, body },
         }
     }
 }
@@ -192,8 +308,8 @@ where
         }
     }
 
-    fn decode_record(read_buf: &mut BytesMut, state: &DecodeState) -> Option<Record> {
-        use Record::*;
+    fn decode_record(read_buf: &mut BytesMut, state: &DecodeState) -> Option<MultiplexRecord> {
+        use MultiplexRecord::*;
 
         if read_buf.len() < state.body_padding_len {
             return None;
@@ -288,7 +404,7 @@ impl<S> Stream for FcgiDecoder<S>
 where
     S: AsyncRead,
 {
-    type Item = Record;
+    type Item = MultiplexRecord;
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
@@ -360,11 +476,11 @@ impl<S> Sink for FcgiEncoder<S>
 where
     S: AsyncWrite,
 {
-    type SinkItem = Record;
+    type SinkItem = MultiplexRecord;
     type SinkError = io::Error;
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        use Record::*;
+        use MultiplexRecord::*;
 
         if WRITE_SOFT_LIMIT <= self.write_queue.remaining()
             && self.poll_complete()?.is_not_ready()
@@ -462,10 +578,10 @@ const MAX_REQUEST_ID: u16 = 10_000;
 
 struct ServerHandler<R, HF> {
     reader: FcgiDecoder<R>,
-    encoder_tx: mpsc::Sender<Record>,
+    encoder_tx: mpsc::Sender<MultiplexRecord>,
     handler_txes: Vec<Option<mpsc::Sender<Record>>>,
-    handler_management: mpsc::Sender<Record>,
-    next_record: Option<Record>,
+    handler_management: mpsc::Sender<MultiplexRecord>,
+    next_record: Option<MultiplexRecord>,
     handler_factory: HF,
 }
 
@@ -475,8 +591,8 @@ where
     HF: FnMut(mpsc::Receiver<Record>) -> HFR,
     HFR: Stream<Item = Record, Error = ()> + Send + 'static,
 {
-    fn handle_record(&mut self, record: Record) -> Async<()> {
-        let request_id = record.request_id() as usize;
+    fn handle_record(&mut self, record: MultiplexRecord) -> Async<()> {
+        let request_id = record.request_id();
 
         if request_id == 0 {
             // TODO: put handler_management into handler_txes?
@@ -491,13 +607,14 @@ where
                 }
             }
         } else {
-            if let Some(handler_tx_opt) = self.handler_txes.get_mut(request_id) {
+            if let Some(handler_tx_opt) = self.handler_txes.get_mut(request_id as usize) {
                 if let Some(handler_tx) = handler_tx_opt.as_mut() {
-                    if let Err(e) = handler_tx.try_send(record) {
+                    if let Err(e) = handler_tx.try_send(record.into_record()) {
                         if e.is_disconnected() {
                             *handler_tx_opt = None;
                         } else if e.is_full() {
-                            self.next_record = Some(e.into_inner());
+                            self.next_record =
+                                Some(e.into_inner().into_multiplex_record(request_id));
                             return Async::NotReady;
                         } else {
                             unreachable!();
@@ -536,22 +653,23 @@ where
                 return Ok(Async::Ready(()));
             };
 
-            if let Record::BeginRequest { request_id, .. } = &record {
+            if let MultiplexRecord::BeginRequest { request_id, .. } = &record {
                 assert!(*request_id <= MAX_REQUEST_ID);
 
-                let request_id = *request_id as usize;
+                let request_id = *request_id;
 
                 // fill handler slots
-                if self.handler_txes.len() <= request_id {
-                    let new = 0..(request_id - self.handler_txes.len() + 1);
+                if self.handler_txes.len() <= request_id as usize {
+                    let new = 0..(request_id as usize - self.handler_txes.len() + 1);
                     let new = new.map(|_| None);
                     self.handler_txes.extend(new);
                 }
-                let handler_tx = self.handler_txes.get_mut(request_id).unwrap();
+                let handler_tx = self.handler_txes.get_mut(request_id as usize).unwrap();
 
                 let (tx, rx) = mpsc::channel(8);
                 tokio::spawn(
                     (self.handler_factory)(rx)
+                        .map(move |r| r.into_multiplex_record(request_id))
                         .forward(self.encoder_tx.clone().sink_map_err(|_| ()))
                         .map(|_| ()),
                 );
@@ -575,8 +693,8 @@ pub fn server_handler<R, W, HF, HFR, MF, MFR>(
     W: AsyncWrite + Send + 'static,
     HF: FnMut(mpsc::Receiver<Record>) -> HFR + Send + 'static,
     HFR: Stream<Item = Record, Error = ()> + Send + 'static,
-    MF: FnOnce(mpsc::Receiver<Record>) -> MFR + Send + 'static,
-    MFR: Stream<Item = Record, Error = ()> + Send + 'static,
+    MF: FnOnce(mpsc::Receiver<MultiplexRecord>) -> MFR + Send + 'static,
+    MFR: Stream<Item = MultiplexRecord, Error = ()> + Send + 'static,
 {
     let (encoder_tx, encoder_rx) = mpsc::channel(8);
 
