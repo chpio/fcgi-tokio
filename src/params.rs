@@ -109,9 +109,24 @@ pub struct ParamsDecoder<PH> {
 
 impl<PH> ParamsDecoder<PH>
 where
+    PH: ParamHandler + Default,
+{
+    pub fn new() -> ParamsDecoder<PH> {
+        ParamsDecoder {
+            varint_decoder: VarintDecoder::new(),
+            buf: BytesQueue::new(),
+            curr_key_len: None,
+            curr_value_len: None,
+            handler: Some(PH::default()),
+        }
+    }
+}
+
+impl<PH> ParamsDecoder<PH>
+where
     PH: ParamHandler,
 {
-    pub fn new(handler: PH) -> ParamsDecoder<PH> {
+    pub fn with_handler(handler: PH) -> ParamsDecoder<PH> {
         ParamsDecoder {
             varint_decoder: VarintDecoder::new(),
             buf: BytesQueue::new(),
@@ -184,6 +199,6 @@ where
     PH: ParamHandler + Default,
 {
     fn default() -> ParamsDecoder<PH> {
-        ParamsDecoder::new(Default::default())
+        ParamsDecoder::new()
     }
 }
